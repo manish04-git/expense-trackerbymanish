@@ -1,0 +1,9 @@
+{
+  "indexes": [
+    { "collectionGroup": "transactions", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "accountId", "order": "ASCENDING" }, { "fieldPath": "dateKey", "order": "DESCENDING" }] },
+    { "collectionGroup": "transactions", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "toAccountId", "order": "ASCENDING" }, { "fieldPath": "dateKey", "order": "DESCENDING" }] },
+    { "collectionGroup": "transactions", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "categoryId", "order": "ASCENDING" }, { "fieldPath": "dateKey", "order": "DESCENDING" }] },
+    { "collectionGroup": "transactions", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "type", "order": "ASCENDING" }, { "fieldPath": "dateKey", "order": "DESCENDING" }] }
+  ],
+  "fieldOverrides": []
+}

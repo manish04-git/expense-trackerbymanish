@@ -1,0 +1,201 @@
+rules_version = '2';
+
+// Expense Tracker – Firestore Security Rules
+// - Every document lives under users/{uid}/... and is only accessible to that signed-in user.
+// - Documents are validated for shape, types and ranges; ownership (userId) and createdAt are immutable.
+// - No get()/exists() calls are used, so rules cost no extra reads.
+// NOTE: rules validate the SHAPE of data. They cannot verify that an account balance equals the sum of
+// its transactions (that would need a server). The app updates balances atomically with each
+// transaction, and Settings > "Recalculate balances" repairs any drift.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+
+    function str(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    function optStr(d, k, max) { return d.get(k, null) == null || str(d[k], 0, max); }
+    function moneyInt(v) { return v is int && v >= 0 && v <= 10000000000000; }
+    function signedInt(v) { return v is int && v >= -10000000000000 && v <= 10000000000000; }
+    function dateKey(v) { return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    function optDateKey(d, k) { return d.get(k, null) == null || dateKey(d[k]); }
+
+    function createdNow() {
+      return request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time;
+    }
+    function updatedNow() {
+      return request.resource.data.updatedAt == request.time
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['userId', 'createdAt']);
+    }
+
+    // ---------- validators ----------
+    function validUser(d, uid) {
+      return d.keys().hasOnly(['uid', 'email', 'displayName', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['uid', 'email', 'displayName', 'createdAt', 'updatedAt'])
+        && d.uid == uid && str(d.email, 3, 254) && str(d.displayName, 0, 80);
+    }
+
+    function validAccount(d, uid) {
+      return d.keys().hasOnly(['userId', 'name', 'type', 'openingBalance', 'balance', 'color', 'archived', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['userId', 'name', 'type', 'openingBalance', 'balance', 'createdAt', 'updatedAt'])
+        && d.userId == uid && str(d.name, 1, 60)
+        && d.type in ['cash', 'savings', 'current', 'credit_card', 'other']
+        && signedInt(d.openingBalance) && signedInt(d.balance)
+        && optStr(d, 'color', 9) && d.get('archived', false) is bool;
+    }
+
+    function validCategory(d, uid) {
+      return d.keys().hasOnly(['userId', 'name', 'type', 'icon', 'color', 'isDefault', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['userId', 'name', 'type', 'icon', 'color', 'createdAt', 'updatedAt'])
+        && d.userId == uid && str(d.name, 1, 40) && d.type in ['income', 'expense']
+        && str(d.icon, 1, 40) && str(d.color, 4, 9) && d.get('isDefault', false) is bool;
+    }
+
+    function validTransaction(d, uid) {
+      return d.keys().hasOnly(['userId', 'type', 'amount', 'categoryId', 'accountId', 'toAccountId', 'paymentMethod',
+                               'date', 'dateKey', 'description', 'notes', 'recurringId', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['userId', 'type', 'amount', 'accountId', 'paymentMethod', 'date', 'dateKey', 'createdAt', 'updatedAt'])
+        && d.userId == uid
+        && d.type in ['income', 'expense', 'transfer', 'refund']
+        && d.amount is int && d.amount > 0 && d.amount <= 10000000000000
+        && str(d.accountId, 1, 40)
+        && d.paymentMethod in ['cash', 'upi', 'debit_card', 'credit_card', 'bank_transfer', 'other']
+        && d.date is timestamp && dateKey(d.dateKey)
+        && str(d.get('description', ''), 0, 200) && str(d.get('notes', ''), 0, 1000)
+        && optStr(d, 'recurringId', 80)
+        && (d.type == 'transfer'
+              ? (d.get('toAccountId', null) is string && d.toAccountId != d.accountId)
+              : d.get('categoryId', null) is string);
+    }
+
+    function validBudget(d, uid) {
+      return d.keys().hasOnly(['userId', 'name', 'kind', 'categoryId', 'period', 'amount', 'startDate', 'endDate', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['userId', 'name', 'kind', 'period', 'amount', 'createdAt', 'updatedAt'])
+        && d.userId == uid && str(d.name, 1, 60)
+        && d.kind in ['overall', 'category'] && d.period in ['weekly', 'monthly', 'custom']
+        && d.amount is int && d.amount > 0 && d.amount <= 10000000000000
+        && (d.kind != 'category' || d.get('categoryId', null) is string)
+        && optDateKey(d, 'startDate') && optDateKey(d, 'endDate')
+        && (d.period != 'custom' || (d.get('startDate', null) is string && d.get('endDate', null) is string));
+    }
+
+    function validRecurring(d, uid) {
+      return d.keys().hasOnly(['userId', 'title', 'type', 'amount', 'categoryId', 'accountId', 'paymentMethod', 'frequency',
+                               'startDate', 'endDate', 'runCount', 'active', 'lastRunAt', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['userId', 'title', 'type', 'amount', 'categoryId', 'accountId', 'paymentMethod', 'frequency',
+                            'startDate', 'runCount', 'active', 'createdAt', 'updatedAt'])
+        && d.userId == uid && str(d.title, 1, 80) && d.type in ['income', 'expense']
+        && d.amount is int && d.amount > 0 && d.amount <= 10000000000000
+        && str(d.categoryId, 1, 40) && str(d.accountId, 1, 40)
+        && d.paymentMethod in ['cash', 'upi', 'debit_card', 'credit_card', 'bank_transfer', 'other']
+        && d.frequency in ['daily', 'weekly', 'monthly', 'yearly']
+        && dateKey(d.startDate) && optDateKey(d, 'endDate')
+        && d.runCount is int && d.runCount >= 0 && d.active is bool
+        && (d.get('lastRunAt', null) == null || d.lastRunAt is timestamp);
+    }
+
+    function validGoal(d, uid) {
+      return d.keys().hasOnly(['userId', 'name', 'targetAmount', 'currentAmount', 'targetDate', 'description', 'completed', 'history', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['userId', 'name', 'targetAmount', 'currentAmount', 'completed', 'history', 'createdAt', 'updatedAt'])
+        && d.userId == uid && str(d.name, 1, 60)
+        && d.targetAmount is int && d.targetAmount > 0 && d.targetAmount <= 10000000000000
+        && moneyInt(d.currentAmount) && d.completed is bool
+        && d.history is list && d.history.size() <= 100
+        && optDateKey(d, 'targetDate') && optStr(d, 'description', 500);
+    }
+
+    function validSubscription(d, uid) {
+      return d.keys().hasOnly(['userId', 'name', 'amount', 'billingCycle', 'nextPaymentDate', 'categoryId', 'reminderDays', 'active', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['userId', 'name', 'amount', 'billingCycle', 'nextPaymentDate', 'categoryId', 'reminderDays', 'active', 'createdAt', 'updatedAt'])
+        && d.userId == uid && str(d.name, 1, 60)
+        && d.amount is int && d.amount > 0 && d.amount <= 10000000000000
+        && d.billingCycle in ['weekly', 'monthly', 'quarterly', 'yearly']
+        && dateKey(d.nextPaymentDate) && str(d.categoryId, 1, 40)
+        && d.reminderDays is int && d.reminderDays >= 0 && d.reminderDays <= 30 && d.active is bool;
+    }
+
+    function validNotification(d, uid) {
+      return d.keys().hasOnly(['userId', 'kind', 'title', 'message', 'read', 'createdAt'])
+        && d.keys().hasAll(['userId', 'kind', 'title', 'message', 'read', 'createdAt'])
+        && d.userId == uid && d.kind in ['budget', 'subscription', 'goal']
+        && str(d.title, 1, 120) && str(d.message, 0, 300) && d.read is bool;
+    }
+
+    function validSettings(d, uid) {
+      return d.keys().hasOnly(['userId', 'currency', 'language', 'theme', 'dateFormat', 'fyStartMonth', 'defaultAccountId', 'notifications', 'updatedAt'])
+        && d.keys().hasAll(['userId', 'currency', 'language', 'theme', 'dateFormat', 'fyStartMonth', 'notifications', 'updatedAt'])
+        && d.userId == uid && d.updatedAt == request.time
+        && d.currency in ['INR', 'USD', 'EUR', 'GBP'] && d.language in ['en']
+        && d.theme in ['light', 'dark', 'system']
+        && d.dateFormat in ['dd MMM yyyy', 'dd/MM/yyyy', 'MM/dd/yyyy', 'yyyy-MM-dd']
+        && d.fyStartMonth is int && d.fyStartMonth >= 1 && d.fyStartMonth <= 12
+        && optStr(d, 'defaultAccountId', 40)
+        && d.notifications is map
+        && d.notifications.keys().hasOnly(['budgetAlerts', 'subscriptionReminders', 'goalAlerts'])
+        && d.notifications.get('budgetAlerts', true) is bool
+        && d.notifications.get('subscriptionReminders', true) is bool
+        && d.notifications.get('goalAlerts', true) is bool;
+    }
+
+    // ---------- collections ----------
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create: if isOwner(uid) && validUser(request.resource.data, uid) && createdNow();
+      allow update: if isOwner(uid) && validUser(request.resource.data, uid) && updatedNow()
+                    && request.resource.data.email == resource.data.email;
+      allow delete: if isOwner(uid);
+
+      match /accounts/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid) && validAccount(request.resource.data, uid) && createdNow();
+        allow update: if isOwner(uid) && validAccount(request.resource.data, uid) && updatedNow();
+      }
+      match /categories/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid) && validCategory(request.resource.data, uid) && createdNow();
+        allow update: if isOwner(uid) && validCategory(request.resource.data, uid) && updatedNow();
+      }
+      match /transactions/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid) && validTransaction(request.resource.data, uid) && createdNow();
+        allow update: if isOwner(uid) && validTransaction(request.resource.data, uid) && updatedNow();
+      }
+      match /budgets/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid) && validBudget(request.resource.data, uid) && createdNow();
+        allow update: if isOwner(uid) && validBudget(request.resource.data, uid) && updatedNow();
+      }
+      match /recurringTransactions/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid) && validRecurring(request.resource.data, uid) && createdNow();
+        allow update: if isOwner(uid) && validRecurring(request.resource.data, uid) && updatedNow();
+      }
+      match /savingsGoals/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid) && validGoal(request.resource.data, uid) && createdNow();
+        allow update: if isOwner(uid) && validGoal(request.resource.data, uid) && updatedNow();
+      }
+      match /subscriptions/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid) && validSubscription(request.resource.data, uid) && createdNow();
+        allow update: if isOwner(uid) && validSubscription(request.resource.data, uid) && updatedNow();
+      }
+      match /notifications/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create: if isOwner(uid) && validNotification(request.resource.data, uid)
+                      && request.resource.data.read == false && request.resource.data.createdAt == request.time;
+        // Only the "read" flag may change
+        allow update: if isOwner(uid)
+                      && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+                      && request.resource.data.read is bool;
+      }
+      match /settings/{id} {
+        allow read, delete: if isOwner(uid);
+        allow create, update: if isOwner(uid) && id == 'preferences' && validSettings(request.resource.data, uid);
+      }
+    }
+
+    // Everything else is denied by default.
+  }
+}
